@@ -1,0 +1,486 @@
+import pygame, math, sys, random
+import os
+
+script_path = os.path.abspath(__file__)
+script_dir = os.path.dirname(script_path)
+
+WIDTH, HEIGHT = 1000, 600
+FPS = 60
+WHITE = (255,255,255)
+BLACK = (0,0,0)
+
+# ---------------- CAMERA DRAG ----------------
+camera_x, camera_y = 0, 0
+dragging = False
+last_mouse_pos = None
+
+def tint_image(image, tint_color):
+    tinted = image.copy()
+    tint = pygame.Surface(image.get_size(), pygame.SRCALPHA)
+    tint.fill(tint_color)
+    tinted.blit(tint, (0,0), special_flags=pygame.BLEND_RGBA_MULT)
+    return tinted
+
+# ---------------- PROJECTILES ----------------
+class Projectile:
+    def __init__(self, x, y, dx, dy, speed, damage, team, size):
+        self.x, self.y = x, y
+        self.dx, self.dy = dx, dy
+        self.speed = speed
+        self.damage = damage
+        self.team = team
+        self.size = size
+        self.alive = True
+
+    def update(self, units):
+        if not self.alive: return
+        self.x += self.dx * self.speed
+        self.y += self.dy * self.speed
+
+        # collision
+        for u in units:
+            if u.team != self.team and u.hp > 0:
+                if u.rect().collidepoint(int(self.x), int(self.y)):
+                    u.hp -= self.damage
+                    self.alive = False
+                    break
+
+        if self.x < -2000 or self.x > WIDTH+2000 or self.y < -2000 or self.y > HEIGHT+2000:
+            self.alive = False
+    
+    def draw(self, screen, camera_x, camera_y):
+        color = (255, 50, 50) if self.team == "red" else (50, 50, 255)
+        pygame.draw.circle(
+            screen,
+            color,
+            (int(self.x - camera_x), int(self.y - camera_y)),
+            self.size
+        )
+
+# ---------------- GRENADES ----------------
+class GrenadeProjectile(Projectile):
+    def __init__(self, x, y, dx, dy, speed, damage, team, size, radius):
+        super().__init__(x, y, dx, dy, speed, damage, team, size)
+        self.radius = radius
+        self.exploding = False
+        self.explosion_timer = 0
+        self.explosion_duration = 20  # frames
+
+    def update(self, units):
+        if self.exploding:
+            self.explosion_timer += 1
+            if self.explosion_timer > self.explosion_duration:
+                self.alive = False
+            return
+
+        # move like a projectile
+        self.x += self.dx * self.speed
+        self.y += self.dy * self.speed
+
+        # check collision
+        for u in units:
+            if u.team != self.team and u.hp > 0:
+                if u.rect().collidepoint(int(self.x), int(self.y)):
+                    self.exploding = True
+                    self.explode(units)
+                    break
+
+    def explode(self, units):
+        for u in units:
+            if u.team != self.team and u.hp > 0:
+                dist = math.hypot(u.x - self.x, u.y - self.y)
+                if dist <= self.radius:
+                    u.hp -= self.damage
+        self.explosion_timer = 0
+
+    def draw(self, screen, camera_x, camera_y):
+        if self.exploding:
+            alpha = 150 - int((self.explosion_timer / self.explosion_duration) * 150)
+            surf = pygame.Surface((self.radius*2, self.radius*2), pygame.SRCALPHA)
+            color = (255, 150, 0, alpha) if self.team=="red" else (0, 200, 255, alpha)
+            pygame.draw.circle(surf, color, (self.radius, self.radius), self.radius)
+            screen.blit(surf, (int(self.x - self.radius - camera_x),
+                               int(self.y - self.radius - camera_y)))
+        else:
+            color = (100,100,100)
+            pygame.draw.circle(screen, color,
+                               (int(self.x - camera_x), int(self.y - camera_y)),
+                               self.size)
+
+# ---------------- RL AGENT ----------------
+class RLAgent:
+    def __init__(self, actions):
+        self.q = {}
+        self.actions = actions
+
+    def get_q(self, state, action):
+        return self.q.get((state, action), 0.0)
+
+    def choose_action(self, state, eps=0.1, emotion=None):
+        if random.random() < eps:
+            return random.choice(self.actions)
+
+        qs = [(a, self.get_q(state,a)) for a in self.actions]
+
+        # add emotional bias
+        if emotion == "confident":
+            # more likely to attack
+            qs = [(a, q + (5 if a == "attack" else 0)) for a, q in qs]
+        elif emotion == "nervous":
+            # more likely to move away
+            qs = [(a, q + (3 if a in ["left","right","up","down"] else -2)) for a, q in qs]
+        elif emotion == "angry":
+            # reckless: strong preference for attack, even if suboptimal
+            qs = [(a, q + (10 if a == "attack" else -5)) for a, q in qs]
+
+        return max(qs, key=lambda x: x[1])[0]
+
+
+    def learn(self, state, action, reward, next_state, alpha=0.5, gamma=0.9):
+        old = self.get_q(state, action)
+        next_max = max([self.get_q(next_state,a) for a in self.actions], default=0)
+        self.q[(state, action)] = old + alpha * (reward + gamma*next_max - old)
+
+
+# ---------------- UNITS ----------------
+class Unit:
+    def __init__(self, x, y, team, utype, base_images, projectiles):
+        self.team = team
+        self.type = utype
+        self.x, self.y = x, y
+        self.cooldown = 0
+        self.projectiles = projectiles
+        self.beam_target = None
+        self.emotions = ["confident", "nervous", "angry", "neutral"]
+        self.emotion = "neutral" if random.random() > 0.7 else random.choice(self.emotions)
+
+
+        # stats by type (your snippet integrated)
+        if utype == "sword":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 60, 8, 25, 1.5, 32, False
+        elif utype == "archer":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 40, 6, 160, 1.0, 32, False
+        elif utype == "shield":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 100, 4, 20, 1.2, 36, False
+        elif utype == "tank":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 1000, 500, 250, 0.7, 48, False
+        elif utype == "gunman":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 50, 50, 200, 1.2, 32, False
+        elif utype == "laser":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 200, 3, 800, 1.5, 32, False
+        elif utype == "robot":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 500, 5, 1500, 2, 60, False
+        elif utype == "special ops":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 1000, 250, 1000, 2.5, 32, False
+        elif utype == "???":
+            self.hp, self.atk, self.range, self.speed, self.size, self.boss = 5000, 500, 1000, 5.5, 90, True
+        else:
+            raise ValueError(f"Unknown unit type: {utype}")
+
+        self.max_hp = self.hp
+
+        # prepare sprite
+        scaled = pygame.transform.scale(base_images[utype], (self.size, self.size))
+        if team == "red":
+            self.image = tint_image(scaled, (255,100,100,200))
+        else:
+            self.image = tint_image(scaled, (100,100,255,200))
+
+        # RL agent with fake pre-training
+        self.agent = RLAgent(["left","right","up","down","attack"])
+        for _ in range(200):
+            state = (random.randint(-5,5), random.randint(-5,5))
+            action = self.agent.choose_action(state)
+            reward = -abs(state[0]) - abs(state[1])
+            next_state = (max(-5,min(5,state[0]-1)), state[1])
+            self.agent.learn(state, action, reward, next_state)
+
+    def rect(self):
+        return pygame.Rect(int(self.x), int(self.y), self.size, self.size)
+
+    def update(self, units):
+        if self.hp <= 0:
+            return
+        if self.cooldown > 0:
+            self.cooldown -= 1
+        
+        allies_alive = sum(1 for u in units if u.team == self.team and u.hp > 0)
+        enemies_alive = sum(1 for u in units if u.team != self.team and u.hp > 0)
+        self.beam_timer = 0
+
+
+
+
+
+
+        # find nearest enemy
+        enemies = [u for u in units if u.team != self.team and u.hp > 0]
+        if not enemies:
+            return
+        target = min(enemies, key=lambda e: (e.x - self.x) ** 2 + (e.y - self.y) ** 2)
+
+        dx, dy = target.x - self.x, target.y - self.y
+        dist = math.hypot(dx, dy)
+
+        # RL state: coarse relative position
+        state = (int(dx // 50), int(dy // 50))
+        action = self.agent.choose_action(state, eps=0.05)
+
+        reward = -0.05  # step penalty to avoid wandering
+
+        atk = self.atk
+        speed = self.speed
+
+        if self.emotion == "confident":
+            atk *= 1.8
+            speed *= 1.5
+            self.hp = min(self.hp + 0.1, self.max_hp + 20)
+
+        # ATTACK
+        if action == "attack" and dist <= self.range and self.cooldown == 0:
+            if self.type in ["sword", "shield"]:
+                target.hp -= self.atk
+                self.cooldown = 40
+            elif self.type in ["archer", "gunman"]:
+                dx, dy = dx / dist, dy / dist
+                self.projectiles.append(
+                    Projectile(self.x + self.size // 2, self.y + self.size // 2,
+                            dx, dy, 6, self.atk, self.team, 4)
+                )
+                self.cooldown = 50
+            elif self.type == "tank":
+                dx, dy = dx / dist, dy / dist
+                self.projectiles.append(
+                    Projectile(self.x + self.size // 2, self.y + self.size // 2,
+                            dx, dy, 3, self.atk, self.team, 10)
+                )
+                self.cooldown = 80
+            elif self.type == "special ops":
+                self.beam_target = None  
+
+                choice = random.choice(["bullet", "beam", "grenade"])
+                dx, dy = target.x - self.x, target.y - self.y
+                dist = math.hypot(dx, dy)
+
+                if dist != 0:
+                    dx, dy = dx / dist, dy / dist
+                else:
+                    dx, dy = 0, 0  # no movement / direction if already overlapping
+
+
+                if choice == "bullet":
+                    self.projectiles.append(
+                        Projectile(self.x+self.size//2, self.y+self.size//2,
+                                dx, dy, 6, self.atk, self.team, 4))
+                    self.cooldown = 40
+
+                elif choice == "beam":
+                    target.hp -= self.atk * 0.2
+                    self.beam_target = target
+                    self.cooldown = 5
+
+                elif choice == "grenade":
+                    self.projectiles.append(
+                        GrenadeProjectile(self.x+self.size//2, self.y+self.size//2,
+                                        dx, dy, 4, self.atk, self.team, 6, radius=60))
+                    self.cooldown = 80
+                
+            elif self.type in ["laser", "robot"]:
+                if target.hp > 0:
+                    target.hp -= self.atk * 0.2
+                self.beam_target = target
+                self.beam_timer = 10   # beam stays visible for 10 frames
+                self.cooldown = 2
+            elif self.type == "???":
+                self.beam_target = None  
+                choice = random.choice([ "beam", "melee"])
+                dx, dy = dx / dist, dy / dist
+
+                if choice == "beam":
+                    if target.hp > 0:
+                        target.hp -= self.atk * 2
+                    self.beam_target = target
+                    self.beam_timer = 15
+                    self.cooldown = 3
+                elif choice == "melee":
+                    target.hp -= self.atk * 0.1
+                    self.cooldown = 1
+
+            reward += 100
+            if target.hp <= 0:
+                reward += 1000
+
+        else:
+            # MOVE
+            self.beam_target = None
+            old_dist = dist
+            if action == "left":
+                self.x -= self.speed
+            elif action == "right":
+                self.x += self.speed
+            elif action == "up":
+                self.y -= self.speed
+            elif action == "down":
+                self.y += self.speed
+
+            # reward moving closer
+            new_dist = math.hypot(target.x - self.x, target.y - self.y)
+            if new_dist < old_dist:
+                reward += 0.5   # bonus for moving closer
+            else:
+                reward -= 0.5   # penalty for moving away
+
+        reward -= 0.00001 * (self.max_hp - self.hp) # Will this even do anything? (for future me to figure out)
+
+        # RL update
+        next_state = (int((target.x - self.x) // 50), int((target.y - self.y) // 50))
+        self.agent.learn(state, action, reward, next_state)
+
+        if self.boss != True and (enemies_alive > allies_alive * 2 and enemies_alive > 3):
+            self.emotion = "nervous"
+        elif target.hp <= 0 or allies_alive > enemies_alive:
+            self.emotion = "confident"
+            
+        elif random.random() < 0.01:  # sometimes get mad
+            self.emotion = "angry"
+
+
+
+
+    def draw(self, screen, camera_x, camera_y):
+        screen.blit(self.image, (int(self.x - camera_x), int(self.y - camera_y)))
+        bar_w, bar_h = self.size, 5
+        pygame.draw.rect(screen, BLACK,
+                         (self.x - camera_x, self.y-8 - camera_y, bar_w, bar_h))
+        hp_ratio = max(0, self.hp/self.max_hp)
+        pygame.draw.rect(screen, (0,255,0),
+                         (self.x - camera_x, self.y-8 - camera_y, int(bar_w*hp_ratio), bar_h))
+
+        if (self.type in ["laser","robot","special ops","???"]) and self.beam_target:
+            # countdown if target is already dead
+            if self.beam_target.hp <= 0 and self.type == "???":
+                if self.beam_timer > 0:
+                    self.beam_timer -= 1
+                else:
+                    self.beam_target = None
+
+            if self.beam_target and (self.beam_target.hp > 0 or self.beam_timer > 0):
+                start = (int(self.x + self.size//2 - camera_x),
+                        int(self.y + self.size//2 - camera_y))
+                end   = (int(self.beam_target.x + self.beam_target.size//2 - camera_x),
+                        int(self.beam_target.y + self.beam_target.size//2 - camera_y))
+
+                if self.type == "???":
+                    color = (180, 0, 180)
+                    width = 20
+                elif self.type == "special ops":
+                    color = (255, 215, 0)
+                    width = 6
+                else:
+                    color = (255,0,0) if self.team=="red" else (0,200,255)
+                    width = 4
+
+                pygame.draw.line(screen, color, start, end, width)
+
+
+
+# ---------------- SPAWN ----------------
+def spawn_armies(base_images, projectiles,
+                 red_counts, blue_counts):
+    units = []
+    spacing_y = 60
+    spacing_x = 70
+    margin = 80
+
+    def place_units(counts, team, x_start):
+        row = col = 0
+        for utype, count in counts.items():
+            for i in range(count):
+                max_rows = HEIGHT // spacing_y
+                y = margin + row * spacing_y
+                x = x_start + col * spacing_x
+                units.append(Unit(x, y, team, utype, base_images, projectiles))
+                row += 1
+                if row >= max_rows:
+                    row = 0
+                    col += 1
+
+    place_units(red_counts, "red", 100)
+    place_units(blue_counts, "blue", WIDTH - 200)
+
+    return units
+
+# ---------------- MAIN ----------------
+def main():
+    global camera_x, camera_y, dragging, last_mouse_pos
+
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 36)
+
+    base_images = {
+        "sword": pygame.image.load(f"{script_dir}/assets/sword.png").convert_alpha(),
+        "archer": pygame.image.load(f"{script_dir}/assets/archer.jpg").convert_alpha(),
+        "tank": pygame.image.load(f"{script_dir}/assets/tank.jpg").convert_alpha(),
+        "shield": pygame.image.load(f"{script_dir}/assets/shield.jpg").convert_alpha(),
+        "gunman": pygame.image.load(f"{script_dir}/assets/gunman.jpg").convert_alpha(),
+        "laser": pygame.image.load(f"{script_dir}/assets/laser.jpg").convert_alpha(),
+        "robot": pygame.image.load(f"{script_dir}/assets/robot.jpg").convert_alpha(),
+        "special ops": pygame.image.load(f"{script_dir}/assets/star.jpg").convert_alpha(),
+        "???": pygame.image.load(f"{script_dir}/assets/corruption.png").convert_alpha(),
+    }
+
+    projectiles = []
+    units = spawn_armies(base_images, projectiles,
+                        red_counts={"???": 1},
+                        blue_counts={"tank": 10})
+
+    running = True
+    while running:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                if e.button == 1:
+                    dragging = True
+                    last_mouse_pos = e.pos
+            elif e.type == pygame.MOUSEBUTTONUP:
+                if e.button == 1:
+                    dragging = False
+            elif e.type == pygame.MOUSEMOTION and dragging:
+                mx, my = e.pos
+                lx, ly = last_mouse_pos
+                camera_x -= (mx - lx)
+                camera_y -= (my - ly)
+                last_mouse_pos = e.pos
+
+        screen.fill(WHITE)
+
+        reds_alive, blues_alive = False, False
+        for u in units:
+            u.update(units)
+            if u.hp > 0:
+                u.draw(screen, camera_x, camera_y)
+                if u.team=="red": reds_alive = True
+                if u.team=="blue": blues_alive = True
+
+        for p in projectiles:
+            p.update(units)
+            if p.alive:
+                p.draw(screen, camera_x, camera_y)
+        projectiles[:] = [p for p in projectiles if p.alive]
+
+        if not reds_alive or not blues_alive:
+            msg = "Red Wins!" if reds_alive else "Blue Wins!"
+            txt = font.render(msg, True, BLACK)
+            screen.blit(txt, (WIDTH//2 - txt.get_width()//2, HEIGHT//2))
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+    pygame.quit()
+    sys.exit()
+
+if __name__=="__main__":
+    main()
